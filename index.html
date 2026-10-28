@@ -62,7 +62,7 @@ class TF extends AudioWorkletProcessor {
       if (d.mode) this.mode = d.mode;
       if (d.gain !== undefined) this.gain = d.gain;
       if (d.vol !== undefined) this.vol = d.vol;
-      if (d.measure) this.meas = { t: 0, fired: false };
+      if (d.measure) this.meas = { t: 0, noise: 0, max: 0 };
     };
   }
   process(inputs, outputs) {
@@ -74,12 +74,17 @@ class TF extends AudioWorkletProcessor {
       const a = Math.abs(x); if (a > this.peak) this.peak = a;
       let y = 0;
       if (this.meas) {
-        // Impulsion au 1er échantillon, puis on compte jusqu'au retour.
-        if (!this.meas.fired) { y = 0.8; this.meas.fired = true; this.meas.t = 0; }
+        // 100 ms de bruit de fond, puis salve de 2 ms ; on compte depuis le début de la salve.
+        const m = this.meas, pre = sampleRate / 10, burst = sampleRate / 500;
+        m.t++;
+        if (m.t <= pre) { if (a > m.noise) m.noise = a; }
         else {
-          this.meas.t++;
-          if (this.meas.t > 64 && a > 0.1) { this.port.postMessage({ rt: this.meas.t }); this.meas = null; }
-          else if (this.meas.t > sampleRate) { this.port.postMessage({ rt: -1 }); this.meas = null; }
+          const t = m.t - pre;
+          if (t <= burst) y = (t & 16) ? -0.9 : 0.9;
+          if (a > m.max) m.max = a;
+          const thr = Math.max(0.01, m.noise * 4);
+          if (t > 64 && a > thr) { this.port.postMessage({ rt: t }); this.meas = null; }
+          else if (t > sampleRate) { this.port.postMessage({ rt: -1, max: m.max, thr }); this.meas = null; }
         }
       } else if (this.mode === 'clean') y = x * this.vol;
       else if (this.mode === 'drive') y = Math.tanh(x * this.gain) * this.vol;
@@ -138,7 +143,11 @@ function onMsg(e) {
     $('vu').style.background = d.peak > 0.95 ? 'var(--bad)' : 'var(--ok)';
   }
   if (d.rt !== undefined) {
-    if (d.rt < 0) { $('rt').textContent = 'Pas de retour détecté (câble ? volume ?)'; runs = []; $('measure').disabled = false; return; }
+    if (d.rt < 0) {
+      $('rt').textContent = `Pas de retour détecté après ${runs.length} clic(s) — max reçu ${d.max.toFixed(3)}, seuil ${d.thr.toFixed(3)}`;
+      $('rt').style.color = 'var(--bad)'; runs = []; $('measure').disabled = false; return;
+    }
+    $('rt').textContent = `clic ${runs.length + 1}/5…`;
     runs.push(d.rt / ctx.sampleRate * 1000);
     if (runs.length < 5) setTimeout(() => node.port.postMessage({ measure: true }), 300);
     else {
