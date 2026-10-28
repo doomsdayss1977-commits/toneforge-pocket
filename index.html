@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>ToneForge Pocket — test latence</title>
+<style>
+  :root { --bg:#141414; --fg:#eee; --mut:#999; --acc:#e8a33d; --ok:#5c5; --bad:#e55; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; color:var(--acc); }
+  p.sub { margin:0 0 16px; color:var(--mut); font-size:14px; }
+  button { font:inherit; padding:12px 16px; border:0; border-radius:10px; background:#333; color:var(--fg); width:100%; margin:6px 0; }
+  button.main { background:var(--acc); color:#000; font-weight:600; }
+  button:disabled { opacity:.4; }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  label { display:block; margin:12px 0 4px; color:var(--mut); font-size:14px; }
+  input[type=range] { width:100%; }
+  .meter { height:10px; background:#222; border-radius:5px; overflow:hidden; }
+  .meter div { height:100%; width:0; background:var(--ok); }
+  pre { background:#0c0c0c; padding:10px; border-radius:8px; font-size:13px; white-space:pre-wrap; }
+  .big { font-size:28px; font-weight:700; }
+</style>
+</head>
+<body>
+<h1>ToneForge Pocket</h1>
+<p class="sub">Prototype 1 : passe-son + mesure de latence. Branche la guitare dans l'entrée 1 de l'interface.</p>
+
+<button id="start" class="main">Démarrer l'audio</button>
+
+<label>Niveau d'entrée</label>
+<div class="meter"><div id="vu"></div></div>
+
+<div class="row">
+  <button id="mClean" disabled>Clean</button>
+  <button id="mDrive" disabled>Drive</button>
+  <button id="mMute" disabled>Muet</button>
+</div>
+<label>Gain drive : <span id="gv">8</span></label>
+<input id="gain" type="range" min="1" max="60" value="8">
+<label>Volume : <span id="vv">0.5</span></label>
+<input id="vol" type="range" min="0" max="1" step="0.01" value="0.5">
+
+<label>Mesure de la latence aller-retour (câble de la sortie vers l'entrée 1, guitare débranchée, volume bas)</label>
+<button id="measure" disabled>Mesurer (5 clics)</button>
+<div id="rt" class="big">—</div>
+
+<label>Infos</label>
+<pre id="info">Pas démarré.</pre>
+
+<script>
+// Le worklet est inline (Blob) pour garder un seul fichier.
+const WORKLET = `
+class TF extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.mode = 'clean'; this.gain = 8; this.vol = 0.5;
+    this.peak = 0; this.n = 0;
+    this.meas = null; // { t, done }
+    this.port.onmessage = e => {
+      const d = e.data;
+      if (d.mode) this.mode = d.mode;
+      if (d.gain !== undefined) this.gain = d.gain;
+      if (d.vol !== undefined) this.vol = d.vol;
+      if (d.measure) this.meas = { t: 0, fired: false };
+    };
+  }
+  process(inputs, outputs) {
+    const inp = inputs[0] && inputs[0][0];
+    const out = outputs[0];
+    const N = out[0].length;
+    for (let i = 0; i < N; i++) {
+      const x = inp ? inp[i] : 0;
+      const a = Math.abs(x); if (a > this.peak) this.peak = a;
+      let y = 0;
+      if (this.meas) {
+        // Impulsion au 1er échantillon, puis on compte jusqu'au retour.
+        if (!this.meas.fired) { y = 0.8; this.meas.fired = true; this.meas.t = 0; }
+        else {
+          this.meas.t++;
+          if (this.meas.t > 64 && a > 0.1) { this.port.postMessage({ rt: this.meas.t }); this.meas = null; }
+          else if (this.meas.t > sampleRate) { this.port.postMessage({ rt: -1 }); this.meas = null; }
+        }
+      } else if (this.mode === 'clean') y = x * this.vol;
+      else if (this.mode === 'drive') y = Math.tanh(x * this.gain) * this.vol;
+      for (const ch of out) ch[i] = y;
+    }
+    if (++this.n % 8 === 0) { this.port.postMessage({ peak: this.peak }); this.peak = 0; }
+    return true;
+  }
+}
+registerProcessor('tf', TF);
+`;
+
+const $ = id => document.getElementById(id);
+let ctx, node, stream;
+
+async function start() {
+  $('start').disabled = true;
+  try {
+    // iOS 16.4+ : session lecture+enregistrement pour un vrai duplex.
+    if (navigator.audioSession) navigator.audioSession.type = 'play-and-record';
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false, latency: 0 } });
+    ctx = new AudioContext({ latencyHint: 0 });
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+    await ctx.audioWorklet.addModule(url);
+    node = new AudioWorkletNode(ctx, 'tf', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+    ctx.createMediaStreamSource(stream).connect(node);
+    node.connect(ctx.destination);
+    node.port.onmessage = onMsg;
+    await ctx.resume();
+    ['mClean', 'mDrive', 'mMute', 'measure'].forEach(id => $(id).disabled = false);
+    $('start').textContent = 'Audio actif';
+    showInfo();
+  } catch (e) {
+    $('info').textContent = 'Erreur : ' + e.name + ' — ' + e.message;
+    $('start').disabled = false;
+  }
+}
+
+function showInfo(extra = '') {
+  const s = stream.getAudioTracks()[0].getSettings();
+  const ms = v => v === undefined ? 'n/d' : (v * 1000).toFixed(1) + ' ms';
+  $('info').textContent =
+    `Entrée : ${stream.getAudioTracks()[0].label || 'inconnue'}\n` +
+    `Fréquence : ${ctx.sampleRate} Hz, canaux entrée : ${s.channelCount ?? 'n/d'}\n` +
+    `baseLatency : ${ms(ctx.baseLatency)}\noutputLatency : ${ms(ctx.outputLatency)}\n` +
+    `latence entrée annoncée : ${ms(s.latency)}\n` +
+    `audioSession : ${navigator.audioSession ? navigator.audioSession.type : 'non supporté'}` + extra;
+}
+
+let runs = [];
+function onMsg(e) {
+  const d = e.data;
+  if (d.peak !== undefined) {
+    $('vu').style.width = Math.min(100, d.peak * 100) + '%';
+    $('vu').style.background = d.peak > 0.95 ? 'var(--bad)' : 'var(--ok)';
+  }
+  if (d.rt !== undefined) {
+    if (d.rt < 0) { $('rt').textContent = 'Pas de retour détecté (câble ? volume ?)'; runs = []; $('measure').disabled = false; return; }
+    runs.push(d.rt / ctx.sampleRate * 1000);
+    if (runs.length < 5) setTimeout(() => node.port.postMessage({ measure: true }), 300);
+    else {
+      const m = runs.slice().sort((a, b) => a - b)[2];
+      $('rt').textContent = m.toFixed(1) + ' ms' + (m <= 15 ? ' ✓ jouable' : m <= 25 ? ' ~ limite' : ' ✗ trop lent');
+      $('rt').style.color = m <= 15 ? 'var(--ok)' : m <= 25 ? 'var(--acc)' : 'var(--bad)';
+      showInfo('\nmesures : ' + runs.map(r => r.toFixed(1)).join(', ') + ' ms');
+      runs = []; $('measure').disabled = false;
+    }
+  }
+}
+
+$('start').onclick = start;
+$('mClean').onclick = () => node.port.postMessage({ mode: 'clean' });
+$('mDrive').onclick = () => node.port.postMessage({ mode: 'drive' });
+$('mMute').onclick = () => node.port.postMessage({ mode: 'mute' });
+$('gain').oninput = e => { $('gv').textContent = e.target.value; node && node.port.postMessage({ gain: +e.target.value }); };
+$('vol').oninput = e => { $('vv').textContent = e.target.value; node && node.port.postMessage({ vol: +e.target.value }); };
+$('measure').onclick = () => { $('measure').disabled = true; $('rt').textContent = '…'; runs = []; node.port.postMessage({ measure: true }); };
+</script>
+</body>
+</html>
